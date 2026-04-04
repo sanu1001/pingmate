@@ -149,24 +149,30 @@ Authorization: Bearer <token>
 
 ```
 pingmate/
-├── cmd/server/main.go          # Entry point
+├── cmd/server/main.go                  # Entry point + dependency wiring
 ├── internal/
-│   ├── auth/
-│   │   ├── handler.go          # HTTP handlers for auth
-│   │   ├── service.go          # Business logic
-│   │   └── middleware.go       # JWT validation middleware
-│   ├── reminder/
-│   │   ├── handler.go          # HTTP handlers for reminders
-│   │   ├── service.go          # Business logic
-│   │   └── repository.go       # DB queries
+│   ├── models/
+│   │   ├── user.go                     # User struct
+│   │   └── reminder.go                 # Reminder + NotificationLog structs
+│   ├── repository/
+│   │   ├── user_repository.go          # UserRepository interface + Postgres impl
+│   │   └── reminder_repository.go      # ReminderRepository interface + Postgres impl
+│   ├── services/
+│   │   ├── auth_service.go             # AuthService interface + implementation
+│   │   └── reminder_service.go         # ReminderService interface + implementation
+│   ├── handlers/
+│   │   ├── auth_handler.go             # Auth HTTP handlers
+│   │   └── reminder_handler.go         # Reminder HTTP handlers
+│   ├── middleware/
+│   │   └── auth_middleware.go          # JWT validation + Redis blacklist check
 │   └── scheduler/
-│       └── worker.go           # Background polling goroutine
-├── db/migrations/              # Ordered SQL migration files
+│       └── worker.go                   # Background polling goroutine
+├── db/migrations/                      # Ordered SQL migration files
 ├── config/
-│   ├── config.go               # Env loader
-│   ├── db.go                   # PostgreSQL connection
-│   └── redis.go                # Redis connection
-├── docs/                       # Swagger + Architecture docs
+│   ├── config.go                       # Env loader
+│   ├── db.go                           # PostgreSQL connection
+│   └── redis.go                        # Redis connection
+├── docs/                               # Swagger + Architecture docs
 ├── .env.example
 ├── docker-compose.yml
 ├── Dockerfile
@@ -206,4 +212,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-<p align="center">Built by <a href="https://github.com/<your-username>">@your-username</a> · Part of a backend portfolio series</p>
+<p align="center">Built by <a href="https://github.com/sanu1001">@sanu1001</a> · Part of a backend portfolio series</p>
