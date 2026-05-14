@@ -14,6 +14,7 @@ type Config struct {
 	RedisAddr      string
 	JWTSecret      string
 	JWTExpiryHours int
+	GINMode        string
 }
 
 var App Config
@@ -34,6 +35,7 @@ func Load() {
 		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
 		JWTSecret:      getEnv("JWT_SECRET", ""),
 		JWTExpiryHours: hours,
+		GINMode:        getEnv("GIN_MODE", "debug"),
 	}
 
 	if App.DatabaseURL == "" {

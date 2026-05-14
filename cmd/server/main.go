@@ -41,6 +41,7 @@ func main() {
 	go sched.Start()
 
 	// ─── STAGE 5: Router setup ───────────────────────────
+	gin.SetMode(config.App.GINMode)
 	r := gin.Default()
 
 	r.GET("/health", func(c *gin.Context) {
