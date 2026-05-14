@@ -1,8 +1,8 @@
 # PingMate — Architecture Document
 
-> **Version:** 1.1
-> **Status:** Active
-> **Scope:** V1 — Single-service, single-region, developer-local to production-ready
+> **Version:** 2.0
+> **Status:** V1 Complete
+> **Scope:** Single-service, single-region, developer-local to production-ready
 
 ---
 
@@ -19,7 +19,7 @@ The design intentionally avoids distributed complexity. There is no message brok
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                        CLIENT                           │
-│         (Mobile App / Web App / curl / Postman)         │
+│         (Mobile App / Web App / curl / Bruno)           │
 └────────────────────────┬────────────────────────────────┘
                          │ HTTP/REST
                          ▼
@@ -27,34 +27,34 @@ The design intentionally avoids distributed complexity. There is no message brok
 │                    PINGMATE API                         │
 │                  (Gin HTTP Server)                      │
 │                                                         │
-│  ┌─────────────┐   ┌──────────────┐   ┌─────────────┐  │
-│  │  Auth Layer │   │ Reminder API │   │  Scheduler  │  │
-│  │  (JWT/bcrypt│   │  (CRUD)      │   │  (goroutine)│  │
-│  └──────┬──────┘   └──────┬───────┘   └──────┬──────┘  │
-│         │                 │                   │         │
-└─────────┼─────────────────┼───────────────────┼─────────┘
-          │                 │                   │
-    ┌─────▼─────┐     ┌─────▼──────┐     ┌─────▼──────┐
-    │   Redis   │     │ PostgreSQL │     │ PostgreSQL │
-    │ (JWT      │     │ (users,    │     │ (reminders,│
-    │ blacklist)│     │  reminders)│     │  logs)     │
-    └───────────┘     └────────────┘     └────────────┘
+│  ┌─────────────┐   ┌──────────────┐   ┌─────────────┐   │
+│  │ Auth Layer  │   │ Reminder API │   │  Scheduler  │   │
+│  │ JWT/bcrypt  │   │ CRUD + Rate  │   │ (goroutine) │   │
+│  └──────┬──────┘   └──────┬───────┘   └──────┬──────┘   │
+│         │                 │                  │          │
+└─────────┼─────────────────┼──────────────────┼──────────┘
+          │                 │                  │
+    ┌─────▼──────┐    ┌─────▼──────┐    ┌─────▼──────┐
+    │   Redis    │    │ PostgreSQL │    │ PostgreSQL │
+    │ blacklist  │    │ users,     │    │ reminders, │
+    │ rate ctr.  │    │ reminders  │    │ logs       │
+    └────────────┘    └────────────┘    └────────────┘
 ```
 
-All three data interactions go to PostgreSQL. Redis is exclusively used for JWT blacklisting on logout.
+PostgreSQL stores all persistent data. Redis is used exclusively for JWT blacklisting and rate limiting counters.
 
 ---
 
 ## 3. Layer Architecture
 
-PingMate uses **dependency inversion across all three layers**. Each layer depends on the interface of the layer below it — never the concrete type. Concrete implementations are wired together only in `cmd/server/main.go`.
+PingMate uses **dependency inversion across all layers**. Each layer depends on the interface of the layer below it — never the concrete type. Concrete implementations are wired together only in `cmd/server/main.go`.
 
 ```
 HTTP Request
      │
      ▼
 ┌────────────┐
-│ Middleware │  ← JWT validation. Attaches user_id to Gin context.
+│ Middleware │  ← JWT validation + rate limiting. Attaches user_id to context.
 └─────┬──────┘
       │
       ▼
@@ -76,7 +76,7 @@ HTTP Request
 **Wiring happens only in `main.go`:**
 ```go
 repo    := repository.NewUserRepo(config.DB)
-svc     := services.NewAuthService(repo)
+svc     := services.NewAuthService(repo, config.Redis)
 handler := handlers.NewAuthHandler(svc)
 ```
 
@@ -95,10 +95,10 @@ This means:
 | File | Responsibility |
 |---|---|
 | `config.go` | Loads `.env` via godotenv. Exposes a single `App` struct. Fails fast if required vars are missing. |
-| `db.go` | Opens and pings PostgreSQL. Sets connection pool limits. Exposes `config.DB`. |
+| `db.go` | Opens and pings PostgreSQL. Sets connection pool limits (25 max open, 10 idle). Exposes `config.DB`. |
 | `redis.go` | Opens and pings Redis. Exposes `config.Redis`. |
 
-**Design decision:** All config is loaded once at startup into a package-level struct. No `os.Getenv` scattered through the codebase.
+All config is loaded once at startup into a package-level struct. No `os.Getenv` scattered through the codebase.
 
 ---
 
@@ -108,96 +108,138 @@ Pure data structs. No methods, no logic, no imports from other internal packages
 
 | File | Contents |
 |---|---|
-| `models/user.go` | `User` struct matching the `users` table |
-| `models/reminder.go` | `Reminder` struct, `NotificationLog` struct, `RecurrenceType` and `LogStatus` type aliases |
+| `models/user.go` | `User`, `RegisterRequest`, `LoginRequest`, `AuthResponse` |
+| `models/reminder.go` | `Reminder`, `NotificationLog`, `RecurrenceType`, `LogStatus`, request DTOs |
+
+`User.Password` is tagged with `json:"-"` to guarantee the password hash never leaks in any JSON response, even accidentally.
 
 ---
 
 ### 4.3 Repository (`internal/repository/`)
 
-Database access only. Each file defines an interface and its concrete PostgreSQL implementation. No business logic lives here — only SQL.
+Database access only. Each file defines an interface and its concrete PostgreSQL implementation.
 
-| File | Interface | Responsibility |
+| File | Interface | Methods |
 |---|---|---|
-| `repository/user_repository.go` | `UserRepository` | `CreateUser`, `FindByEmail`, `FindByID` |
-| `repository/reminder_repository.go` | `ReminderRepository` | `Create`, `FindAll`, `FindByID`, `Update`, `Delete`, `FindDueReminders` |
+| `user_repository.go` | `UserRepository` | `CreateUser`, `FindByEmail`, `FindByID` |
+| `reminder_repository.go` | `ReminderRepository` | `Create`, `FindAll`, `FindByID`, `Update`, `Delete`, `FindDueReminders`, `CreateLog` |
 
-The service layer only ever calls the `UserRepository` or `ReminderRepository` interface — never the concrete struct.
+The service layer only ever calls these interfaces — never the concrete struct.
 
 #### Repository query strategy
 
 | Operation | Query |
 |---|---|
-| Create | `INSERT` with `RETURNING id` |
+| Create | `INSERT` with `RETURNING id, created_at` |
 | FindAll | `SELECT WHERE user_id = $1 ORDER BY scheduled_at ASC` |
 | FindByID | `SELECT WHERE id = $1 AND user_id = $2` — ownership enforced at DB level |
 | Update | `UPDATE WHERE id = $1 AND user_id = $2` |
 | Delete | `DELETE WHERE id = $1 AND user_id = $2` |
 | FindDueReminders | `SELECT WHERE scheduled_at <= NOW() AND is_active = TRUE` |
 
-The `AND user_id` clause on every mutating query means even if an ID is guessed, a different user's data is never touched.
+**Defensive UUID handling:** `FindByID` and `Delete` catch PostgreSQL's `invalid input syntax for type uuid` error and treat it as "not found" rather than a server error. This means invalid IDs return 404 to the client instead of 500.
 
 ---
 
 ### 4.4 Services (`internal/services/`)
 
-Business logic layer. Calls repository interfaces, enforces rules, returns domain models or errors. Has no knowledge of Gin, HTTP status codes, or `sql.DB`.
+Business logic layer. Calls repository interfaces, enforces rules, returns domain models or typed errors.
 
 | File | Interface | Responsibility |
 |---|---|---|
-| `services/auth_service.go` | `AuthService` | Register (hash + store), Login (verify + issue JWT), Logout (blacklist token in Redis) |
-| `services/reminder_service.go` | `ReminderService` | Create, List, Get, Update, Delete — all scoped by `user_id` from JWT context |
+| `auth_service.go` | `AuthService` | Register, Login, Logout, IsBlacklisted |
+| `reminder_service.go` | `ReminderService` | Create, GetAll, GetByID, Update, Delete |
 
 #### Auth service flows
 
 **Register:**
 ```
-ValidateInput → FindByEmail (conflict check) → bcrypt hash → CreateUser → return user
+ValidateInput → FindByEmail (uniqueness check) → bcrypt hash → CreateUser → generateToken → return
 ```
 
 **Login:**
 ```
-FindByEmail → bcrypt.CompareHashAndPassword → GenerateJWT → return token
+FindByEmail → bcrypt.CompareHashAndPassword → generateToken → return
 ```
 
 **Logout:**
 ```
-ParseJWT claims → extract exp → Redis SET token with TTL = remaining lifetime
+ParseJWT claims → extract expiry → Redis SET blacklist:{token} with TTL = remaining lifetime
 ```
+
+**Token generation:** HS256-signed JWT with claims `user_id`, `email`, `exp`, `iat`. Expiry configurable via `JWT_EXPIRY_HOURS`.
+
+#### Reminder service patterns
+
+- **Ownership-first:** every method takes `userID` as the first parameter. Never trusts request bodies for ownership.
+- **Merge updates:** `Update` fetches current state first, then only overwrites fields the client sent. Empty/zero values are treated as "unchanged."
+- **Empty slice vs nil:** `GetAll` returns `[]Reminder{}` instead of `nil` so JSON responses are always `[]`, never `null`.
 
 ---
 
 ### 4.5 Handlers (`internal/handlers/`)
 
-HTTP layer only. Parses and validates incoming requests, calls the service interface, and writes JSON responses. Has no knowledge of SQL, bcrypt, or Redis.
+HTTP layer only. Parses and validates incoming requests, calls the service interface, and writes JSON responses.
 
 | File | Responsibility |
 |---|---|
-| `handlers/auth_handler.go` | `POST /auth/register`, `POST /auth/login`, `POST /auth/logout` |
-| `handlers/reminder_handler.go` | `POST`, `GET`, `GET/:id`, `PUT/:id`, `DELETE/:id` on `/reminders` |
+| `auth_handler.go` | `POST /auth/register`, `POST /auth/login`, `POST /auth/logout` |
+| `reminder_handler.go` | `POST`, `GET`, `GET/:id`, `PUT/:id`, `DELETE/:id` on `/reminders` |
 
-`user_id` is always read from the Gin context set by middleware — never from the request body.
+`user_id` is always read from the Gin context (set by middleware) — never from the request body.
+
+Each handler maps typed service errors to appropriate HTTP status codes:
+
+```go
+errors.Is(err, services.ErrEmailExists)        → 409 Conflict
+errors.Is(err, services.ErrInvalidCredentials) → 401 Unauthorized
+errors.Is(err, services.ErrReminderNotFound)   → 404 Not Found
+default                                        → 500 Internal Server Error
+```
+
+Handlers also include swaggo annotations (`@Summary`, `@Tags`, `@Param`, etc.) that auto-generate the Swagger UI documentation.
 
 ---
 
 ### 4.6 Middleware (`internal/middleware/`)
 
-Sits between the Gin router and all protected handlers.
+#### Auth middleware — `auth_middleware.go`
 
-| File | Responsibility |
-|---|---|
-| `middleware/auth_middleware.go` | Extract Bearer token → verify signature + expiry → check Redis blacklist → attach `user_id` to context → `c.Next()` |
+Sits between the router and all protected handlers.
 
-**JWT Validation flow:**
 ```
 Every protected route:
   │
   ├── Extract Bearer token from Authorization header
   ├── Verify signature + expiry (golang-jwt)
+  ├── Reject any non-HMAC signing method (algorithm confusion defence)
   ├── Check Redis blacklist → reject if found
-  ├── Attach user_id to Gin context
+  ├── Attach user_id and user_email to Gin context
   └── c.Next()
 ```
+
+#### Rate limit middleware — `rate_limit_middleware.go`
+
+Redis-backed **fixed window counter** scoped per user.
+
+```
+Every write request:
+  │
+  ├── INCR rate:{user_id}
+  ├── If count == 1: EXPIRE rate:{user_id} 60s (start window)
+  ├── Read TTL and set X-RateLimit-* response headers
+  ├── If count > limit (30): return 429 Too Many Requests
+  └── Else: c.Next()
+```
+
+Headers returned:
+- `X-RateLimit-Limit` — the configured limit (30)
+- `X-RateLimit-Remaining` — requests left in the current window
+- `X-RateLimit-Reset` — seconds until the counter resets
+
+Applied only to `POST`, `PUT`, `DELETE` on `/reminders`. Read routes (`GET`) are not rate limited.
+
+**Fail-open policy:** if Redis is unreachable, the middleware allows the request through rather than blocking all users due to an infrastructure hiccup.
 
 ---
 
@@ -206,26 +248,37 @@ Every protected route:
 Runs as a long-running goroutine launched at server startup. Receives a `ReminderRepository` interface — no direct `sql.DB` access.
 
 ```
-scheduler.Start(repo ReminderRepository)
+scheduler.Start()
   │
-  └── goroutine:
-        loop every 30 seconds:
-          │
-          ├── repo.FindDueReminders()
-          │
-          ├── for each reminder:
-          │     ├── Log the trigger
-          │     ├── repo.CreateNotificationLog(status: sent/failed)
-          │     └── if recurrence != 'none':
-          │           repo.Update(scheduled_at = next occurrence)
-          │         else:
-          │           repo.Update(is_active = false)
-          │
-          └── sleep(30s)
+  ├── Run tick() immediately on boot (don't wait 30s)
+  │
+  └── time.NewTicker(30s) → for range ticker.C:
+        │
+        └── tick():
+              │
+              ├── repo.FindDueReminders()  (WHERE scheduled_at <= NOW() AND is_active = TRUE)
+              │
+              └── for each reminder:
+                    │
+                    ├── Log to console: "🔔 TRIGGERED: <title> for <user_id>"
+                    │
+                    ├── repo.CreateLog(NotificationLog{status: sent})
+                    │
+                    └── Advance state:
+                          ├── recurrence = 'none'    → IsActive = false
+                          ├── recurrence = 'daily'   → ScheduledAt.AddDate(0, 0, 1)
+                          ├── recurrence = 'weekly'  → ScheduledAt.AddDate(0, 0, 7)
+                          └── recurrence = 'monthly' → ScheduledAt.AddDate(0, 1, 0)
+                    
+                    repo.Update(reminder)
 ```
 
 **Why polling and not a push model?**
-For V1 scope, a polling loop is simpler, has zero external dependencies, and is accurate to within 30 seconds — sufficient for reminders. A push model (e.g. pg_notify or a job queue) would be the natural V2 upgrade.
+For V1 scope, a polling loop is simpler, has zero external dependencies, and is accurate to within 30 seconds — sufficient for human-scale reminders. A push model (e.g. pg_notify or a job queue) would be the natural V2 upgrade.
+
+**Calendar-aware date math:** Uses `time.AddDate(years, months, days)` for recurrence. This correctly handles month boundaries (Feb 28 → Mar 28, not "Feb 31"). Raw `time.Hour * 24 * 30` would drift.
+
+**Failure isolation:** if logging or updating one reminder errors out, the scheduler logs a warning and continues with the rest. One bad row never blocks the batch.
 
 ---
 
@@ -275,11 +328,14 @@ status       ENUM('sent','failed')
 |---|---|
 | Password storage | `bcrypt` cost factor 12 — resistant to brute force |
 | Token format | JWT (HS256), signed with `JWT_SECRET` |
-| Token claims | `user_id`, `email`, `exp` |
+| Token claims | `user_id`, `email`, `exp`, `iat` |
 | Token lifetime | Configurable via `JWT_EXPIRY_HOURS` (default 72h) |
 | Logout / invalidation | Token stored in Redis with TTL = remaining lifetime |
+| Algorithm verification | Middleware explicitly rejects non-HMAC signing methods |
 | Route protection | Gin middleware — rejects missing, invalid, or blacklisted tokens |
 | Ownership enforcement | All DB queries include `user_id` in WHERE clause |
+| Rate limiting | 30 req/min per user on write endpoints |
+| Secret leakage | All credentials in `.env`, gitignored |
 
 ---
 
@@ -293,20 +349,20 @@ All error responses follow a consistent envelope:
 }
 ```
 
-HTTP status codes are used semantically:
+HTTP status codes used semantically:
 
 | Status | Usage |
 |---|---|
 | `200` | Success |
 | `201` | Resource created |
 | `400` | Bad request / validation failure |
-| `401` | Missing or invalid token |
-| `403` | Valid token, wrong owner |
-| `404` | Resource not found |
+| `401` | Missing, invalid, or blacklisted token |
+| `404` | Resource not found (also catches invalid UUID input) |
 | `409` | Conflict (e.g. email already registered) |
-| `500` | Internal server error |
+| `429` | Rate limit exceeded |
+| `500` | Unexpected internal server error |
 
-Errors from the repository layer are never leaked raw to the client. The service and handler layers translate DB errors into appropriate HTTP responses.
+Errors from the repository layer are never leaked raw to the client. Service and handler layers translate DB errors into appropriate HTTP responses.
 
 ---
 
@@ -315,27 +371,20 @@ Errors from the repository layer are never leaked raw to the client. The service
 ### Docker Compose (local dev)
 
 ```
-┌─────────────────────────────┐
-│     docker-compose.yml      │
-│                             │
-│  ┌──────────┐ ┌──────────┐  │
-│  │ postgres │ │  redis   │  │
-│  │  :5432   │ │  :6379   │  │
-│  └──────────┘ └──────────┘  │
-└─────────────────────────────┘
+┌─────────────────────────────────┐
+│       docker-compose.yml        │
+│                                 │
+│  ┌──────────┐  ┌──────────┐     │
+│  │ postgres │  │  redis   │     │
+│  │  :5433   │  │  :6379   │     │
+│  └──────────┘  └──────────┘     │
+└─────────────────────────────────┘
       ↑ Go server runs locally, connects to both
 ```
 
-Migrations are mounted into `docker-entrypoint-initdb.d/` and run automatically on first container start, in filename order.
+PostgreSQL is exposed on `5433` (not the default `5432`) to avoid conflicts with local PostgreSQL installations.
 
-### Dockerfile (multi-stage)
-
-```
-Stage 1: golang:1.22-alpine  → compile binary
-Stage 2: alpine:latest        → copy binary only
-```
-
-Final image contains only the compiled binary — no Go toolchain, no source code.
+Migrations are mounted into `/docker-entrypoint-initdb.d` and run automatically on first container creation, in filename order.
 
 ---
 
@@ -343,34 +392,46 @@ Final image contains only the compiled binary — no Go toolchain, no source cod
 
 ### Create Reminder (Happy Path)
 ```
-Client       Router      Middleware      Handler        Service       Repository    PostgreSQL
-  │             │              │              │              │               │              │
-  │─POST /reminders──►         │              │              │               │              │
-  │             │──validate JWT►              │              │               │              │
-  │             │              │──attach uid─►│              │               │              │
-  │             │              │              │─CreateReminder►              │              │
-  │             │              │              │              │─Insert(reminder►             │
-  │             │              │              │              │               │─INSERT SQL──►│
-  │             │              │              │              │               │◄─id returned─│
-  │             │              │              │              │◄─reminder obj─│              │
-  │◄────────────────────────────────────201 + body──────────│               │              │
+Client     Router    AuthMW    RateLimitMW    Handler    Service    Repo    PostgreSQL
+  │          │          │           │            │          │         │          │
+  │-POST--►  │          │           │            │          │         │          │
+  │          │-verify JWT►          │            │          │         │          │
+  │          │          │-INCR Redis►            │          │         │          │
+  │          │          │           │-Create───► │          │         │          │
+  │          │          │           │            │-Create──►│         │          │
+  │          │          │           │            │          │-Insert─►│          │
+  │          │          │           │            │          │         │-INSERT──►│
+  │          │          │           │            │          │         │◄─id──────│
+  │          │          │           │            │          │◄────────│          │
+  │◄─────────────────────────201 + body────────────────────│          │          │
 ```
 
 ### Scheduler Tick
 ```
-Scheduler Goroutine         Repository              PostgreSQL
-        │                        │                       │
-        │──FindDueReminders()───►│                       │
-        │                        │──SELECT SQL──────────►│
-        │                        │◄─[]Reminder───────────│
-        │◄──[]Reminder───────────│                       │
-        │                        │                       │
-        │  for each reminder:    │                       │
-        │──CreateLog()──────────►│──INSERT SQL──────────►│
-        │──Update(next/inactive)─►──UPDATE SQL──────────►│
-        │◄──ok───────────────────│◄─ok───────────────────│
-        │                        │                       │
-        │  sleep 30s → loop      │                       │
+Scheduler          Repository         PostgreSQL
+    │                  │                   │
+    │-FindDueReminders►│                   │
+    │                  │-SELECT───────────►│
+    │                  │◄─[]Reminder───────│
+    │◄─────[]Reminder──│                   │
+    │                                      │
+    │  for each:                           │
+    │-CreateLog(sent)─►│-INSERT───────────►│
+    │-Update(advance)─►│-UPDATE───────────►│
+    │◄─────────ok──────│◄──ok──────────────│
+    │                                      │
+    │  sleep 30s → loop                    │
+```
+
+### JWT Blacklist Check
+```
+Request with token  →  AuthMW  →  Redis  GET blacklist:{token}
+                                    │
+                          ┌─────────┴─────────┐
+                          │                   │
+                       returns nil       returns "1"
+                          │                   │
+                       allow → Next()    abort 401
 ```
 
 ---
@@ -383,18 +444,22 @@ Scheduler Goroutine         Repository              PostgreSQL
 | `database/sql` over ORM | Full SQL control, no magic, easier to reason about queries | More boilerplate than GORM |
 | Goroutine scheduler over cron/queue | Zero external dependencies, simple to understand | ~30s delivery variance, not horizontally scalable |
 | Redis for JWT blacklist | Stateless JWT + stateful logout without DB writes on every request | Adds Redis as a dependency |
+| Redis fixed-window rate limit | Simple to implement, near-zero overhead | Burst at window edges (can do 2x limit at minute boundary) |
 | PostgreSQL ENUMs | Type safety enforced at DB level | Requires migration to add new values |
 | Monolith | Simpler deploy, single process, ideal for V1 scope | Would need extraction if scaled to multiple services |
-| `uuid` as primary keys | No sequential ID guessing, safe for public APIs | Slightly larger index size vs int |
+| UUID primary keys | No sequential ID guessing, safe for public APIs | Slightly larger index size vs int |
+| Docker initdb migrations | Zero extra tooling, runs automatically on first start | New migrations require volume reset; would migrate to golang-migrate for V2 |
 
 ---
 
 ## 11. Future Improvements (Post V1)
 
 - **Webhook delivery** — HTTP POST to a user-configured URL when a reminder fires
-- **Push notifications** — Firebase/APNS integration
+- **Push notifications** — Firebase Cloud Messaging / APNs integration
 - **pg_notify** — Replace polling with Postgres LISTEN/NOTIFY for instant delivery
-- **Rate limiting** — Gin middleware with Redis token bucket
 - **Refresh tokens** — Short-lived access tokens + long-lived refresh tokens
 - **Pagination** — Cursor-based pagination on reminder list
-- **Metrics** — Prometheus endpoint for scheduler health
+- **Metrics** — Prometheus endpoint for scheduler health and request latency
+- **Distributed scheduler** — Postgres advisory lock or dedicated job queue for multi-instance deployment
+- **Sliding-window rate limiter** — replace fixed window with token bucket for smoother bursts
+- **golang-migrate** — proper migration tool with up/down support for V2 schema changes
