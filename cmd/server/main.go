@@ -8,6 +8,7 @@ import (
 	"github.com/sanu1001/pingmate/internal/handlers"
 	"github.com/sanu1001/pingmate/internal/middleware"
 	"github.com/sanu1001/pingmate/internal/repository"
+	"github.com/sanu1001/pingmate/internal/scheduler"
 	"github.com/sanu1001/pingmate/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -34,6 +35,10 @@ func main() {
 	// ─── STAGE 4: Build handlers (need: services) ────────
 	authHandler := handlers.NewAuthHandler(authSvc)
 	reminderHandler := handlers.NewReminderHandler(reminderSvc)
+
+	// ─── STAGE 4.5: Start the background scheduler ───────
+	sched := scheduler.NewScheduler(reminderRepo, 30*time.Second)
+	go sched.Start()
 
 	// ─── STAGE 5: Router setup ───────────────────────────
 	r := gin.Default()
