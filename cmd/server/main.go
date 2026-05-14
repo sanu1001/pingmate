@@ -12,7 +12,27 @@ import (
 	"github.com/sanu1001/pingmate/internal/services"
 
 	"github.com/gin-gonic/gin"
+
+	_ "github.com/sanu1001/pingmate/docs"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 )
+
+// @title           PingMate API
+// @version         1.0
+// @description     Developer-first scheduled reminder REST API
+// @termsOfService  http://swagger.io/terms/
+
+// @contact.name   sanu1001
+// @contact.url    https://github.com/sanu1001
+
+// @host      localhost:8080
+// @BasePath  /api/v1
+
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
+// @description Type "Bearer" followed by a space and your JWT token
 
 func main() {
 	// ─── STAGE 1: Bootstrap dependencies ─────────────────
@@ -50,6 +70,9 @@ func main() {
 			"service": "PingMate",
 		})
 	})
+
+	// Swagger UI
+	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	v1 := r.Group("/api/v1")
 	{
