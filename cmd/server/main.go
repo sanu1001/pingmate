@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/sanu1001/pingmate/config"
 	"github.com/sanu1001/pingmate/internal/handlers"
@@ -56,11 +57,18 @@ func main() {
 		{
 			protected.POST("/auth/logout", authHandler.Logout)
 
-			protected.POST("/reminders", reminderHandler.Create)
+			// Rate limited reminder write routes (30 requests/minute)
+			rateLimited := protected.Group("/")
+			rateLimited.Use(middleware.RateLimitMiddleware(30, time.Minute))
+			{
+				rateLimited.POST("/reminders", reminderHandler.Create)
+				rateLimited.PUT("/reminders/:id", reminderHandler.Update)
+				rateLimited.DELETE("/reminders/:id", reminderHandler.Delete)
+			}
+
+			// Read routes — not rate limited (reads are cheap)
 			protected.GET("/reminders", reminderHandler.GetAll)
 			protected.GET("/reminders/:id", reminderHandler.GetByID)
-			protected.PUT("/reminders/:id", reminderHandler.Update)
-			protected.DELETE("/reminders/:id", reminderHandler.Delete)
 		}
 	}
 

@@ -3,6 +3,7 @@ package repository
 import (
 	"database/sql"
 	"errors"
+	"strings"
 
 	"github.com/sanu1001/pingmate/internal/models"
 )
@@ -104,6 +105,12 @@ func (r *reminderRepo) FindByID(id string, userID string) (*models.Reminder, err
 		return nil, nil
 	}
 
+	// Postgres rejects non-UUID strings with this error code (22P02)
+	// Treat invalid UUID format as "not found" not a server error
+	if err != nil && strings.Contains(err.Error(), "invalid input syntax for type uuid") {
+		return nil, nil
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -142,8 +149,16 @@ func (r *reminderRepo) Delete(id string, userID string) error {
 		WHERE id = $1 AND user_id = $2
 	`
 
-	_, err := r.db.Exec(query, id, userID)
-	return err
+	result, err := r.db.Exec(query, id, userID)
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid input syntax for type uuid") {
+			return nil
+		}
+		return err
+	}
+
+	_ = result
+	return nil
 }
 
 func (r *reminderRepo) FindDueReminders() ([]models.Reminder, error) {
