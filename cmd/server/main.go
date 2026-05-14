@@ -4,12 +4,16 @@ import (
 	"log"
 
 	"github.com/sanu1001/pingmate/config"
+	"github.com/sanu1001/pingmate/internal/handlers"
+	"github.com/sanu1001/pingmate/internal/middleware"
+	"github.com/sanu1001/pingmate/internal/repository"
+	"github.com/sanu1001/pingmate/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// ─── STAGE 1: Bootstrap ──────────────────────────────
+	// ─── STAGE 1: Bootstrap dependencies ─────────────────
 	config.Load()
 
 	config.ConnectDB()
@@ -18,9 +22,19 @@ func main() {
 	config.ConnectRedis()
 	defer config.Redis.Close()
 
-	// ─── STAGE 2: (empty for now — wiring comes as we build layers) ───
+	// ─── STAGE 2: Build repositories (need: config.DB) ───
+	userRepo := repository.NewUserRepo(config.DB)
+	reminderRepo := repository.NewReminderRepo(config.DB)
 
-	// ─── STAGE 3: Router ─────────────────────────────────
+	// ─── STAGE 3: Build services (need: repos + Redis) ───
+	authSvc := services.NewAuthService(userRepo, config.Redis)
+	reminderSvc := services.NewReminderService(reminderRepo)
+
+	// ─── STAGE 4: Build handlers (need: services) ────────
+	authHandler := handlers.NewAuthHandler(authSvc)
+	reminderHandler := handlers.NewReminderHandler(reminderSvc)
+
+	// ─── STAGE 5: Router setup ───────────────────────────
 	r := gin.Default()
 
 	r.GET("/health", func(c *gin.Context) {
@@ -30,11 +44,27 @@ func main() {
 		})
 	})
 
-	// v1 group — auth and reminder routes register here as we build them
 	v1 := r.Group("/api/v1")
-	_ = v1 // placeholder until handlers exist
+	{
+		// ─── Public routes (no auth required) ────────────
+		v1.POST("/auth/register", authHandler.Register)
+		v1.POST("/auth/login", authHandler.Login)
 
-	// ─── STAGE 4: Start ──────────────────────────────────
+		// ─── Protected routes (JWT required) ─────────────
+		protected := v1.Group("/")
+		protected.Use(middleware.AuthMiddleware(authSvc))
+		{
+			protected.POST("/auth/logout", authHandler.Logout)
+
+			protected.POST("/reminders", reminderHandler.Create)
+			protected.GET("/reminders", reminderHandler.GetAll)
+			protected.GET("/reminders/:id", reminderHandler.GetByID)
+			protected.PUT("/reminders/:id", reminderHandler.Update)
+			protected.DELETE("/reminders/:id", reminderHandler.Delete)
+		}
+	}
+
+	// ─── STAGE 6: Start server ───────────────────────────
 	log.Printf("PingMate running on :%s", config.App.Port)
 	if err := r.Run(":" + config.App.Port); err != nil {
 		log.Fatalf("Server failed: %v", err)
