@@ -62,7 +62,7 @@ func (s *authService) Register(req models.RegisterRequest) (*models.AuthResponse
 		return nil, ErrEmailExists
 	}
 
-	// 2. Hash the password (bcrypt with cost factor 12)
+	// 2. Hash the password (bcrypt with cost factor 12) ~ 250ms
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 	if err != nil {
 		return nil, err
